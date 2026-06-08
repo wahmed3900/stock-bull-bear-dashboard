@@ -1,0 +1,21 @@
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+@app.route('/predict', methods=['GET'])
+def predict_stock():
+    ticker = request.args.get('ticker', 'AAPL')
+    predictor = Stock30DayPredictor(ticker)
+    result = predictor.predict_and_analyze()
+    
+    return jsonify({
+        'ticker': result['ticker'],
+        'current_price': float(result['current_price']),
+        'predicted_30d_price': float(result['predicted_price_30d']),
+        'expected_return_percent': float(result['percent_change']),
+        'signal': 'BULLISH' if result['percent_change'] > 0 else 'BEARISH'
+    })
+
+# Run with: python app.py
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)

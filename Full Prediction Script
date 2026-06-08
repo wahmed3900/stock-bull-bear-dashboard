@@ -1,0 +1,246 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+class Stock30DayPredictor:
+    def __init__(self, ticker, lookback_days=60, predict_days=30):
+        self.ticker = ticker
+        self.lookback_days = lookback_days  # Days of history to look at
+        self.predict_days = predict_days    # Days to predict ahead
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.model = None
+        
+    def fetch_data(self):
+        """Fetch 2 years of historical data"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=730)  # 2 years for training
+        
+        stock = yf.Ticker(self.ticker)
+        df = stock.history(start=start_date, end=end_date)
+        
+        if df.empty:
+            raise ValueError(f"No data found for ticker {self.ticker}")
+        
+        self.df = df[['Close']].copy()
+        print(f"Fetched {len(self.df)} days of data for {self.ticker}")
+        return self.df
+    
+    def prepare_data(self):
+        """Prepare sequences for LSTM training"""
+        # Scale the data
+        scaled_data = self.scaler.fit_transform(self.df.values)
+        
+        # Create sequences
+        X, y = [], []
+        for i in range(self.lookback_days, len(scaled_data) - self.predict_days):
+            X.append(scaled_data[i - self.lookback_days:i])
+            y.append(scaled_data[i + self.predict_days - 1])  # Target is price at predict_days from now
+        
+        self.X = np.array(X)
+        self.y = np.array(y)
+        
+        # Reshape for LSTM [samples, time steps, features]
+        self.X = self.X.reshape(self.X.shape[0], self.X.shape[1], 1)
+        
+        # Split into train/test (80/20)
+        split = int(0.8 * len(self.X))
+        self.X_train, self.X_test = self.X[:split], self.X[split:]
+        self.y_train, self.y_test = self.y[:split], self.y[split:]
+        
+        print(f"Training samples: {len(self.X_train)}, Test samples: {len(self.X_test)}")
+        
+    def build_model(self):
+        """Build LSTM model"""
+        self.model = Sequential([
+            LSTM(units=100, return_sequences=True, input_shape=(self.lookback_days, 1)),
+            Dropout(0.2),
+            LSTM(units=100, return_sequences=False),
+            Dropout(0.2),
+            Dense(units=50, activation='relu'),
+            Dense(units=1)
+        ])
+        
+        self.model.compile(optimizer='adam', loss='mean_squared_error')
+        print("Model built successfully")
+        
+    def train(self, epochs=50, batch_size=32):
+        """Train the model"""
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        
+        history = self.model.fit(
+            self.X_train, self.y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(self.X_test, self.y_test),
+            callbacks=[early_stop],
+            verbose=1
+        )
+        return history
+    
+    def predict_next_30_days(self):
+        """Predict the next 30 days"""
+        # Get the last lookback_days of data
+        last_sequence = self.df.values[-self.lookback_days:]
+        scaled_sequence = self.scaler.transform(last_sequence.reshape(-1, 1))
+        
+        predictions = []
+        current_sequence = scaled_sequence.copy()
+        
+        for _ in range(self.predict_days):
+            # Reshape for prediction
+            current_input = current_sequence.reshape(1, self.lookback_days, 1)
+            
+            # Predict next day
+            next_pred = self.model.predict(current_input, verbose=0)[0, 0]
+            predictions.append(next_pred)
+            
+            # Update sequence (remove oldest, add prediction)
+            current_sequence = np.append(current_sequence[1:], [[next_pred]], axis=0)
+        
+        # Inverse transform to get actual prices
+        predictions = self.scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+        return predictions.flatten()
+    
+    def evaluate(self):
+        """Evaluate model on test data"""
+        y_pred = self.model.predict(self.X_test)
+        y_pred_actual = self.scaler.inverse_transform(y_pred)
+        y_test_actual = self.scaler.inverse_transform(self.y_test)
+        
+        # Calculate MAPE (Mean Absolute Percentage Error)
+        mape = np.mean(np.abs((y_test_actual - y_pred_actual) / y_test_actual)) * 100
+        print(f"Test MAPE: {mape:.2f}%")
+        return mape
+    
+    def predict_and_analyze(self):
+        """Run full prediction and return bullish/bearish status"""
+        print(f"\n{'='*50}")
+        print(f"Analyzing {self.ticker}")
+        print(f"{'='*50}")
+        
+        # Fetch and prepare data
+        self.fetch_data()
+        self.prepare_data()
+        self.build_model()
+        self.train(epochs=50)
+        
+        # Evaluate
+        mape = self.evaluate()
+        
+        # Get predictions
+        predictions = self.predict_next_30_days()
+        current_price = self.df['Close'].iloc[-1]
+        predicted_price_30d = predictions[-1]
+        
+        # Calculate 30-day expected change
+        percent_change = ((predicted_price_30d - current_price) / current_price) * 100
+        
+        # Determine bullish/bearish
+        if percent_change > 5:
+            status = "STRONG BULLISH 🟢"
+            confidence = "High"
+        elif percent_change > 0:
+            status = "BULLISH 🟢"
+            confidence = "Medium"
+        elif percent_change > -5:
+            status = "BEARISH 🔴"
+            confidence = "Medium"
+        else:
+            status = "STRONG BEARISH 🔴"
+            confidence = "High"
+        
+        # Display results
+        print(f"\n📊 PREDICTION RESULTS for {self.ticker}")
+        print(f"Current Price: ${current_price:.2f}")
+        print(f"Predicted Price (30 days): ${predicted_price_30d:.2f}")
+        print(f"Expected 30-day Change: {percent_change:+.2f}%")
+        print(f"Status: {status}")
+        print(f"Model Confidence (based on MAPE): {confidence} ({100-mape:.1f}% accuracy)")
+        
+        # Show daily predictions
+        print(f"\n📈 Next 30 Days Forecast:")
+        for i, price in enumerate(predictions, 1):
+            day_change = ((price - current_price) / current_price) * 100
+            print(f"  Day {i:2d}: ${price:.2f} ({day_change:+.2f}%)")
+        
+        return {
+            'ticker': self.ticker,
+            'current_price': current_price,
+            'predicted_price_30d': predicted_price_30d,
+            'percent_change': percent_change,
+            'status': status,
+            'daily_predictions': predictions,
+            'mape': mape
+        }
+    
+    def plot_predictions(self):
+        """Plot historical data and 30-day prediction"""
+        predictions = self.predict_next_30_days()
+        
+        # Create date ranges
+        history_dates = self.df.index[-60:]  # Last 60 days
+        future_dates = pd.date_range(start=self.df.index[-1], periods=self.predict_days + 1, freq='D')[1:]
+        
+        plt.figure(figsize=(15, 6))
+        plt.plot(history_dates, self.df['Close'].values[-60:], label='Historical (60 days)', color='blue')
+        plt.plot(future_dates, predictions, label='Predicted (30 days)', color='red', linestyle='--', marker='o')
+        plt.axhline(y=self.df['Close'].iloc[-1], color='gray', linestyle=':', alpha=0.5, label='Current Price')
+        
+        plt.title(f'{self.ticker} - 30 Day Price Prediction')
+        plt.xlabel('Date')
+        plt.ylabel('Price ($)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'{self.ticker}_prediction.png')
+        plt.show()
+        print(f"Chart saved as {self.ticker}_prediction.png")
+
+
+# ============= USAGE EXAMPLE =============
+
+# Single stock prediction
+predictor = Stock30DayPredictor(ticker='AAPL', lookback_days=60, predict_days=30)
+result = predictor.predict_and_analyze()
+predictor.plot_predictions()
+
+# ============= MULTIPLE STOCKS SCREENER =============
+
+def screen_stocks_for_next_30_days(tickers_list):
+    """Screen multiple stocks and rank by predicted performance"""
+    results = []
+    
+    for ticker in tickers_list:
+        try:
+            predictor = Stock30DayPredictor(ticker, lookback_days=60, predict_days=30)
+            result = predictor.predict_and_analyze()
+            results.append(result)
+            print(f"\n✅ Completed {ticker}\n")
+        except Exception as e:
+            print(f"❌ Failed {ticker}: {str(e)}")
+    
+    # Create comparison dataframe
+    df_results = pd.DataFrame(results)
+    df_results = df_results.sort_values('percent_change', ascending=False)
+    
+    print("\n" + "="*80)
+    print("STOCK RANKING BY 30-DAY BULLISH POTENTIAL")
+    print("="*80)
+    print(df_results[['ticker', 'current_price', 'predicted_price_30d', 'percent_change', 'status']].to_string(index=False))
+    
+    return df_results
+
+# Example: Screen top tech stocks
+tech_stocks = ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'META', 'TSLA', 'AMZN']
+results_df = screen_stocks_for_next_30_days(tech_stocks)
+
+# Save to CSV
+results_df.to_csv('30day_predictions.csv', index=False)
+print("\n📁 Results saved to '30day_predictions.csv'")

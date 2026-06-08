@@ -1,0 +1,225 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from flask import Flask, jsonify, request
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============= LSTM PREDICTOR CLASS =============
+
+class Stock30DayPredictor:
+    def __init__(self, ticker, lookback_days=60, predict_days=30):
+        self.ticker = ticker
+        self.lookback_days = lookback_days
+        self.predict_days = predict_days
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.model = None
+        self.df = None
+        
+    def fetch_data(self):
+        """Fetch 2 years of historical data"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=730)
+        
+        stock = yf.Ticker(self.ticker)
+        df = stock.history(start=start_date, end=end_date)
+        
+        if df.empty:
+            raise ValueError(f"No data found for ticker {self.ticker}")
+        
+        self.df = df[['Close']].copy()
+        return self.df
+    
+    def prepare_data(self):
+        """Prepare sequences for LSTM training"""
+        scaled_data = self.scaler.fit_transform(self.df.values)
+        
+        X, y = [], []
+        for i in range(self.lookback_days, len(scaled_data) - self.predict_days):
+            X.append(scaled_data[i - self.lookback_days:i])
+            y.append(scaled_data[i + self.predict_days - 1])
+        
+        self.X = np.array(X)
+        self.y = np.array(y)
+        self.X = self.X.reshape(self.X.shape[0], self.X.shape[1], 1)
+        
+        split = int(0.8 * len(self.X))
+        self.X_train, self.X_test = self.X[:split], self.X[split:]
+        self.y_train, self.y_test = self.y[:split], self.y[split:]
+        
+    def build_model(self):
+        """Build LSTM model"""
+        self.model = Sequential([
+            LSTM(units=100, return_sequences=True, input_shape=(self.lookback_days, 1)),
+            Dropout(0.2),
+            LSTM(units=100, return_sequences=False),
+            Dropout(0.2),
+            Dense(units=50, activation='relu'),
+            Dense(units=1)
+        ])
+        
+        self.model.compile(optimizer='adam', loss='mean_squared_error')
+        
+    def train(self, epochs=30, batch_size=32):
+        """Train the model"""
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        
+        self.model.fit(
+            self.X_train, self.y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(self.X_test, self.y_test),
+            callbacks=[early_stop],
+            verbose=0  # Set to 1 if you want to see training progress
+        )
+        
+    def predict_next_30_days(self):
+        """Predict the next 30 days"""
+        last_sequence = self.df.values[-self.lookback_days:]
+        scaled_sequence = self.scaler.transform(last_sequence.reshape(-1, 1))
+        
+        predictions = []
+        current_sequence = scaled_sequence.copy()
+        
+        for _ in range(self.predict_days):
+            current_input = current_sequence.reshape(1, self.lookback_days, 1)
+            next_pred = self.model.predict(current_input, verbose=0)[0, 0]
+            predictions.append(next_pred)
+            current_sequence = np.append(current_sequence[1:], [[next_pred]], axis=0)
+        
+        predictions = self.scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+        return predictions.flatten()
+    
+    def evaluate(self):
+        """Evaluate model accuracy"""
+        y_pred = self.model.predict(self.X_test, verbose=0)
+        y_pred_actual = self.scaler.inverse_transform(y_pred)
+        y_test_actual = self.scaler.inverse_transform(self.y_test)
+        
+        mape = np.mean(np.abs((y_test_actual - y_pred_actual) / y_test_actual)) * 100
+        return mape
+    
+    def predict_and_analyze(self):
+        """Run full prediction pipeline"""
+        self.fetch_data()
+        self.prepare_data()
+        self.build_model()
+        self.train(epochs=30)
+        
+        mape = self.evaluate()
+        predictions = self.predict_next_30_days()
+        
+        current_price = self.df['Close'].iloc[-1]
+        predicted_price_30d = predictions[-1]
+        percent_change = ((predicted_price_30d - current_price) / current_price) * 100
+        
+        return {
+            'ticker': self.ticker,
+            'current_price': current_price,
+            'predicted_price_30d': predicted_price_30d,
+            'percent_change': percent_change,
+            'daily_predictions': predictions.tolist(),
+            'accuracy_score': 100 - mape
+        }
+
+
+# ============= FLASK WEB SERVER =============
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'message': 'Stock 30-Day Prediction API',
+        'endpoints': {
+            '/predict?ticker=AAPL': 'Get prediction for a specific stock',
+            '/predict/batch?tickers=AAPL,MSFT,GOOGL': 'Get predictions for multiple stocks',
+            '/health': 'Check API status'
+        }
+    })
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/predict', methods=['GET'])
+def predict_stock():
+    """Get prediction for a single stock"""
+    ticker = request.args.get('ticker', 'AAPL').upper()
+    
+    try:
+        predictor = Stock30DayPredictor(ticker)
+        result = predictor.predict_and_analyze()
+        
+        return jsonify({
+            'success': True,
+            'ticker': result['ticker'],
+            'current_price': round(result['current_price'], 2),
+            'predicted_30d_price': round(result['predicted_price_30d'], 2),
+            'expected_return_percent': round(result['percent_change'], 2),
+            'signal': 'BULLISH 🟢' if result['percent_change'] > 0 else 'BEARISH 🔴',
+            'model_accuracy_percent': round(result['accuracy_score'], 1),
+            'prediction_date': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'ticker': ticker
+        }), 400
+
+@app.route('/predict/batch', methods=['GET'])
+def predict_batch():
+    """Get predictions for multiple stocks"""
+    tickers_param = request.args.get('tickers', 'AAPL,MSFT,GOOGL')
+    tickers = [t.strip().upper() for t in tickers_param.split(',')]
+    
+    results = []
+    for ticker in tickers:
+        try:
+            predictor = Stock30DayPredictor(ticker)
+            result = predictor.predict_and_analyze()
+            results.append({
+                'ticker': ticker,
+                'current_price': round(result['current_price'], 2),
+                'predicted_price': round(result['predicted_price_30d'], 2),
+                'expected_return': round(result['percent_change'], 2),
+                'signal': 'BULLISH' if result['percent_change'] > 0 else 'BEARISH'
+            })
+        except Exception as e:
+            results.append({
+                'ticker': ticker,
+                'error': str(e)
+            })
+    
+    # Sort by expected return (best performers first)
+    results.sort(key=lambda x: x.get('expected_return', -100), reverse=True)
+    
+    return jsonify({
+        'success': True,
+        'total_stocks': len(tickers),
+        'predictions': results,
+        'timestamp': datetime.now().isoformat()
+    })
+
+# Run the server
+if __name__ == '__main__':
+    print("=" * 60)
+    print("📈 Stock 30-Day Prediction API Server")
+    print("=" * 60)
+    print("\n✅ Server starting on http://localhost:5000")
+    print("\n📌 Available endpoints:")
+    print("   - http://localhost:5000/")
+    print("   - http://localhost:5000/health")
+    print("   - http://localhost:5000/predict?ticker=AAPL")
+    print("   - http://localhost:5000/predict/batch?tickers=AAPL,MSFT,GOOGL,NVDA")
+    print("\n⚠️  First prediction may take 30-60 seconds (model training)")
+    print("=" * 60)
+    
+    app.run(debug=False, host='0.0.0.0', port=5000)
