@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, render_template_string
 import yfinance as yf
-from datetime import datetime, timedelta
+import time
 
 app = Flask(__name__)
 
@@ -64,21 +64,30 @@ def get_stocks():
         try:
             df = yf.download(ticker, period='60d', progress=False)
             
-            if len(df) >= 30:
-                current = df['Close'].iloc[-1]
-                old = df['Close'].iloc[-30]
+            if df is not None and len(df) >= 30:
+                current_series = df['Close'].iloc[-1]
+                old_series = df['Close'].iloc[-30]
+                
+                current = float(current_series.item() if hasattr(current_series, 'item') else current_series)
+                old = float(old_series.item() if hasattr(old_series, 'item') else old_series)
+                
                 momentum = ((current - old) / old) * 100
                 predicted = current * (1 + momentum / 100)
                 
                 results.append({
                     'ticker': ticker,
-                    'price': round(float(current), 2),
-                    'momentum': round(float(momentum), 2),
-                    'predicted': round(float(predicted), 2),
+                    'price': round(current, 2),
+                    'momentum': round(momentum, 2),
+                    'predicted': round(predicted, 2),
                     'signal': '🟢 BULLISH' if momentum > 0 else '🔴 BEARISH'
                 })
+            
+            time.sleep(0.5)
         except Exception as e:
             print(f"Error with {ticker}: {e}")
+    
+    if not results:
+        return jsonify([{'ticker': 'Error', 'price': 0, 'momentum': 0, 'predicted': 0, 'signal': 'Unable to load data'}])
     
     results.sort(key=lambda x: x['momentum'], reverse=True)
     return jsonify(results)
